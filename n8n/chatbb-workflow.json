@@ -1,0 +1,508 @@
+{
+  "name": "ChatBB - Confirmação de presença",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## ChatBB — Confirmação de presença\n\n**Antes de ativar:**\n1. Crie a credencial *Header Auth* (nome do cabeçalho `X-ChatBB-Secret`, valor = N8N_WEBHOOK_SECRET do site) e selecione-a no nó **Webhook**.\n2. Crie/selecione a credencial **Google Sheets** nos nós *Ler confirmações* e *Gravar confirmação* e escolha a planilha/aba **Confirmacoes**.\n3. Revise a constante `CONFIG` no nó *Validar e normalizar* (deve ser igual ao .env do site).\n4. **Concorrência:** defina `N8N_CONCURRENCY_PRODUCTION_LIMIT=1` no n8n (ou worker com `--concurrency=1`). Sem isso, duas requisições simultâneas podem gravar o mesmo nome. Veja n8n/README.md.\n5. Ative o workflow e use a URL **Production** (`/webhook/chatbb-rsvp`).",
+        "height": 420,
+        "width": 520
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000001",
+      "name": "Instruções",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -160,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "chatbb-rsvp",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000002",
+      "name": "Webhook ChatBB",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ],
+      "webhookId": "0d3b6c0e-5d1f-4c1a-8f0e-0000c4a7bb01",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "CONFIGURE",
+          "name": "ChatBB Webhook Secret"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// ChatBB — funções compartilhadas pelos nós Code (inseridas no início de cada nó pelo build).\n// Mantenha a lógica idêntica a src/lib/normalization.ts (há teste de paridade).\n\nconst INVISIBLE = /[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F-\\u009F\\u200B-\\u200F\\u2028-\\u202E\\u2060-\\u2064\\uFEFF]/gu;\nconst ANY_SPACE = /[\\s\\u00A0\\u1680\\u2000-\\u200A\\u202F\\u205F\\u3000]+/gu;\nconst APOSTROPHES = /[\\u2018\\u2019\\u02BC`\\u00B4]/gu;\n\n// Limpeza para gravação/exibição: NFC, sem caracteres invisíveis, espaços colapsados.\nfunction cleanName(raw) {\n  return String(raw)\n    .normalize('NFC')\n    .replace(INVISIBLE, '')\n    .replace(ANY_SPACE, ' ')\n    .trim();\n}\n\n// Forma canônica para detectar duplicidade (sem acentos, minúsculas). Sem comparação aproximada.\nfunction normalizeName(raw) {\n  return cleanName(raw)\n    .normalize('NFKD')\n    .replace(/\\p{M}+/gu, '')\n    .replace(APOSTROPHES, \"'\")\n    .toLowerCase()\n    .replace(ANY_SPACE, ' ')\n    .trim();\n}\n\n// ChatBB — Nó \"Validar e normalizar\" (Code · Run Once for All Items)\n//\n// Revalida TUDO no n8n: não confiamos apenas na validação do Next.js.\n// Saída: { valid: true, data: {...} } ou { valid: false, status: 422, response: {...} }\n\n// ====== CONFIGURAÇÃO — mantenha igual ao .env do site ======================\nconst CONFIG = {\n  MAX_ADULTS: 10,               // = RSVP_MAX_ADULTS\n  MAX_CHILDREN: 10,             // = RSVP_MAX_CHILDREN\n  ALLOW_CHILD_HOLDER: false,    // = RSVP_ALLOW_CHILD_HOLDER\n  EVENT_DATE: '2026-11-22T08:00:00-03:00', // = EVENT_DATE\n  RSVP_DEADLINE: '',            // = RSVP_DEADLINE (vazio = fecha no início do evento)\n  TIMEZONE: 'America/Fortaleza',// = EVENT_TIMEZONE\n};\n// ===========================================================================\n\nconst NAME_MIN = 5;\nconst NAME_MAX = 100;\nconst NAME_PATTERN = /^\\p{L}[\\p{L}\\p{M}' .\\-\\u2019]*$/u;\nconst KEY_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;\n\nfunction invalid(code, fields) {\n  return [{ json: { valid: false, status: 422, response: { ok: false, code, fields: fields || [] } } }];\n}\n\nfunction isCount(value, max) {\n  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= max;\n}\n\nfunction localDateTime(date, timeZone) {\n  const parts = new Intl.DateTimeFormat('en-CA', {\n    timeZone,\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hourCycle: 'h23',\n  }).formatToParts(date);\n  const get = (type) => parts.find((p) => p.type === type).value;\n  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`;\n}\n\nfunction newId() {\n  try {\n    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {\n      return 'rsvp_' + globalThis.crypto.randomUUID();\n    }\n  } catch (e) { /* usa o fallback */ }\n  return 'rsvp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);\n}\n\nconst input = $input.first().json || {};\nconst body = input.body;\n\nif (!body || typeof body !== 'object' || Array.isArray(body)) {\n  return invalid('INVALID_DATA', ['body']);\n}\n\n// 1. Prazo (mesma regra do site: RSVP_DEADLINE, ou o início do evento)\nconst closesAt = Date.parse(CONFIG.RSVP_DEADLINE || CONFIG.EVENT_DATE);\nif (!Number.isNaN(closesAt) && Date.now() >= closesAt) {\n  return [{ json: { valid: false, status: 422, response: { ok: false, code: 'RSVP_CLOSED', fields: [] } } }];\n}\n\n// 2. Campos\nconst errors = [];\n\nconst chave = body.idempotencyKey;\nif (typeof chave !== 'string' || !KEY_PATTERN.test(chave)) errors.push('idempotencyKey');\n\nlet nome = '';\nif (typeof body.nome !== 'string') {\n  errors.push('nome');\n} else {\n  nome = cleanName(body.nome);\n  const words = nome.split(' ').filter(Boolean).length;\n  if (nome.length < NAME_MIN || nome.length > NAME_MAX || !NAME_PATTERN.test(nome) || words < 2) {\n    errors.push('nome');\n  }\n}\n\nconst presenca = body.presenca;\nif (presenca !== 'SIM' && presenca !== 'NAO') errors.push('presenca');\n\nconst rawAdults = body.adultos === undefined || body.adultos === null ? 0 : body.adultos;\nconst rawChildren = body.criancas === undefined || body.criancas === null ? 0 : body.criancas;\nif (!isCount(rawAdults, CONFIG.MAX_ADULTS)) errors.push('adultos');\nif (!isCount(rawChildren, CONFIG.MAX_CHILDREN)) errors.push('criancas');\n\nif (errors.length === 0 && presenca === 'SIM') {\n  const minAdults = CONFIG.ALLOW_CHILD_HOLDER ? 0 : 1;\n  if (rawAdults < minAdults) errors.push('adultos');\n  if (rawAdults + rawChildren < 1) errors.push('criancas');\n}\n\nif (errors.length > 0) return invalid('INVALID_DATA', errors);\n\n// 3. Normalização e montagem da linha\nconst adultos = presenca === 'SIM' ? rawAdults : 0;\nconst criancas = presenca === 'SIM' ? rawChildren : 0;\nconst nomeNormalizado = normalizeName(nome);\n\nreturn [{\n  json: {\n    valid: true,\n    data: {\n      chaveIdempotencia: chave,\n      nomeNormalizado,\n      presenca,\n      row: {\n        id: newId(),\n        data_hora: localDateTime(new Date(), CONFIG.TIMEZONE),\n        nome,\n        nome_normalizado: nomeNormalizado,\n        presenca,\n        adultos,\n        criancas,\n        total_pessoas: adultos + criancas, // titular já incluído em adultos/crianças\n        chave_idempotencia: chave,\n        origem: 'site',\n      },\n    },\n  },\n}];\n"
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000003",
+      "name": "Validar e normalizar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a1f3c1d2-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000004",
+      "name": "Dados válidos?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "COLE_AQUI_O_ID_DA_PLANILHA",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Confirmacoes",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000005",
+      "name": "Ler confirmações",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1200,
+        220
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "CONFIGURE",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// ChatBB — funções compartilhadas pelos nós Code (inseridas no início de cada nó pelo build).\n// Mantenha a lógica idêntica a src/lib/normalization.ts (há teste de paridade).\n\nconst INVISIBLE = /[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F-\\u009F\\u200B-\\u200F\\u2028-\\u202E\\u2060-\\u2064\\uFEFF]/gu;\nconst ANY_SPACE = /[\\s\\u00A0\\u1680\\u2000-\\u200A\\u202F\\u205F\\u3000]+/gu;\nconst APOSTROPHES = /[\\u2018\\u2019\\u02BC`\\u00B4]/gu;\n\n// Limpeza para gravação/exibição: NFC, sem caracteres invisíveis, espaços colapsados.\nfunction cleanName(raw) {\n  return String(raw)\n    .normalize('NFC')\n    .replace(INVISIBLE, '')\n    .replace(ANY_SPACE, ' ')\n    .trim();\n}\n\n// Forma canônica para detectar duplicidade (sem acentos, minúsculas). Sem comparação aproximada.\nfunction normalizeName(raw) {\n  return cleanName(raw)\n    .normalize('NFKD')\n    .replace(/\\p{M}+/gu, '')\n    .replace(APOSTROPHES, \"'\")\n    .toLowerCase()\n    .replace(ANY_SPACE, ' ')\n    .trim();\n}\n\n// ChatBB — Nó \"Decidir\" (Code · Run Once for All Items)\n//\n// Recebe TODAS as linhas da aba Confirmacoes e decide:\n//   • mesma chave de idempotência + mesmo nome  → 200 ALREADY_RECORDED (não grava de novo)\n//   • mesma chave com outro nome                → 409 IDEMPOTENCY_CONFLICT\n//   • nome (normalizado) já existente           → 409 DUPLICATE_NAME (sem revelar a resposta anterior)\n//   • caso contrário                            → action \"write\"\n// Esta decisão só é segura se as execuções forem SERIALIZADAS (ver README: concorrência).\n\nconst data = $('Validar e normalizar').first().json.data;\n\nconst text = (row, key) => String(row[key] === undefined || row[key] === null ? '' : row[key]).trim();\nconst rows = $input.all()\n  .map((item) => item.json || {})\n  .filter((row) => ['id', 'nome', 'nome_normalizado', 'chave_idempotencia'].some((key) => text(row, key) !== ''));\n\nconst rowName = (row) => text(row, 'nome_normalizado') || normalizeName(text(row, 'nome'));\nconst sameName = (row) => rowName(row) === data.nomeNormalizado || normalizeName(text(row, 'nome')) === data.nomeNormalizado;\n\nconst byKey = rows.find((row) => text(row, 'chave_idempotencia') === data.chaveIdempotencia);\nif (byKey) {\n  if (sameName(byKey)) {\n    const stored = text(byKey, 'presenca').toUpperCase() === 'SIM' ? 'SIM' : 'NAO';\n    return [{ json: { action: 'respond', status: 200, response: { ok: true, code: 'ALREADY_RECORDED', presenca: stored } } }];\n  }\n  return [{ json: { action: 'respond', status: 409, response: { ok: false, code: 'IDEMPOTENCY_CONFLICT' } } }];\n}\n\nif (rows.some(sameName)) {\n  return [{ json: { action: 'respond', status: 409, response: { ok: false, code: 'DUPLICATE_NAME' } } }];\n}\n\nreturn [{ json: { action: 'write', row: data.row, presenca: data.presenca } }];\n"
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000006",
+      "name": "Decidir",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a1f3c1d2-0000-4000-8000-000000000002",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "write",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000007",
+      "name": "Gravar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "COLE_AQUI_O_ID_DA_PLANILHA",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Confirmacoes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.row.id }}",
+            "data_hora": "={{ $json.row.data_hora }}",
+            "nome": "={{ $json.row.nome }}",
+            "nome_normalizado": "={{ $json.row.nome_normalizado }}",
+            "presenca": "={{ $json.row.presenca }}",
+            "adultos": "={{ $json.row.adultos }}",
+            "criancas": "={{ $json.row.criancas }}",
+            "total_pessoas": "={{ $json.row.total_pessoas }}",
+            "chave_idempotencia": "={{ $json.row.chave_idempotencia }}",
+            "origem": "={{ $json.row.origem }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "data_hora",
+              "displayName": "data_hora",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nome",
+              "displayName": "nome",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nome_normalizado",
+              "displayName": "nome_normalizado",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "presenca",
+              "displayName": "presenca",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "adultos",
+              "displayName": "adultos",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "criancas",
+              "displayName": "criancas",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "total_pessoas",
+              "displayName": "total_pessoas",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chave_idempotencia",
+              "displayName": "chave_idempotencia",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "origem",
+              "displayName": "origem",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000008",
+      "name": "Gravar confirmação",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1920,
+        120
+      ],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "CONFIGURE",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// ChatBB — Nó \"Resposta 201\" (Code · Run Once for All Items)\n// Só é alcançado DEPOIS que o nó Google Sheets concluiu a gravação com sucesso.\nconst decision = $('Decidir').first().json;\nreturn [{ json: { status: 201, response: { ok: true, code: 'CREATED', presenca: decision.presenca } } }];\n"
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000009",
+      "name": "Resposta 201",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// ChatBB — Nó \"Resposta 503\" (Code · Run Once for All Items)\n// Alcançado quando a leitura ou a gravação no Google Sheets falhou. Nunca devolve detalhes do erro.\nreturn [{ json: { status: 503, response: { ok: false, code: 'SERVICE_UNAVAILABLE' } } }];\n"
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000010",
+      "name": "Resposta 503",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": "={{ $json.status }}"
+        }
+      },
+      "id": "6c1e1c0e-0d6a-4f7e-9a53-000000000011",
+      "name": "Responder ao site",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2400,
+        300
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook ChatBB": {
+      "main": [
+        [
+          {
+            "node": "Validar e normalizar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar e normalizar": {
+      "main": [
+        [
+          {
+            "node": "Dados válidos?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dados válidos?": {
+      "main": [
+        [
+          {
+            "node": "Ler confirmações",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder ao site",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ler confirmações": {
+      "main": [
+        [
+          {
+            "node": "Decidir",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resposta 503",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decidir": {
+      "main": [
+        [
+          {
+            "node": "Gravar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gravar?": {
+      "main": [
+        [
+          {
+            "node": "Gravar confirmação",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder ao site",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gravar confirmação": {
+      "main": [
+        [
+          {
+            "node": "Resposta 201",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resposta 503",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta 201": {
+      "main": [
+        [
+          {
+            "node": "Responder ao site",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resposta 503": {
+      "main": [
+        [
+          {
+            "node": "Responder ao site",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Fortaleza",
+    "executionTimeout": 60,
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

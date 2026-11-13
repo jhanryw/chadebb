@@ -1,0 +1,22 @@
+# dependências
+/node_modules
+
+# build do Next.js
+/.next/
+/out/
+next-env.d.ts
+
+# testes / cobertura
+/coverage
+
+# ambiente local (NUNCA versionar segredos)
+.env
+.env.local
+.env.*.local
+
+# sistema / editor
+.DS_Store
+*.log
+*.tsbuildinfo
+.vscode/
+.idea/
